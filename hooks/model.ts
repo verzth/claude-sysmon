@@ -18,6 +18,9 @@ export const DARWIN_SCRIPT = [
   "echo '@@sysctl'; sysctl -n hw.memsize hw.ncpu vm.swapusage",
   "echo '@@ps'; ps -Aceo pid=,ppid=,pcpu=,rss=,comm=",
   "echo '@@df'; df -kP",
+  "echo '@@nettop'; nettop -P -L 1 -x -n -t external -J bytes_in,bytes_out 2>/dev/null",
+  "echo '@@netstat'; netstat -ibn",
+  "echo '@@idle'; ioreg -c IOHIDSystem -d 4 | awk '/HIDIdleTime/ {print int($NF/1000000000); exit}'",
 ].join('\n')
 
 export const LINUX_SCRIPT = [
@@ -28,6 +31,7 @@ export const LINUX_SCRIPT = [
   "echo '@@ncpu'; nproc; cat /proc/loadavg",
   "echo '@@ps'; ps -Aeo pid=,ppid=,pcpu=,rss=,comm=",
   "echo '@@df'; df -kP",
+  "echo '@@netdev'; cat /proc/net/dev",
 ].join('\n')
 
 export function sections(text: string): Record<string, string> {

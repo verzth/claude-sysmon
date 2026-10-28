@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { History, KillState, Level, Proc, Sample } from '../types'
+import type { History, IgnoredNet, KillState, Level, Net, NetAlert, NetDetails, NetProc, Proc, Sample } from '../types'
 import { band } from './band'
 import {
   BAR_COLOR,
@@ -15,6 +15,7 @@ import {
   cpuLevel,
   DARWIN_SCRIPT,
   LINUX_SCRIPT,
+  parseProcs,
   parseSample,
   pct,
   protection,
@@ -22,7 +23,30 @@ import {
   ramLevel,
   sparkSvg,
   sparkText,
+  sections,
 } from './model'
+import {
+  alertNotes,
+  CLEAR_MS,
+  type Counter,
+  detailsScript,
+  duration,
+  ignoreKey,
+  newTracker,
+  notificationScript,
+  OUT_RATE,
+  parseDetails,
+  parseNetstat,
+  parseNettop,
+  parseProcNetDev,
+  netSparkSvg,
+  rateText,
+  scaled,
+  step,
+  totalRates,
+  VOLUME,
+  WINDOW_MS,
+} from './net'
 
 const PANE = 'sysmon'
 const FAST_MS = 2_000 // pane open: a new sample this long after the last one ended (iostat adds one second)
@@ -31,11 +55,19 @@ const SAMPLE_TIMEOUT_MS = 15_000
 const TERM_WAIT_MS = 2_000 // how long a process gets to quit after SIGTERM
 const KILL_WAIT_MS = 1_000
 
-const sampleState = atom({ plugin: 'sysmon', key: 'sample' } as const, null, { shape: 'sample-1' })
+const sampleState = atom({ plugin: 'sysmon', key: 'sample' } as const, null, { shape: 'sample-2' })
 const sampleError = atom({ plugin: 'sysmon', key: 'error' } as const, null)
 const history = atom({ plugin: 'sysmon', key: 'history' } as const, { cpu: [], ram: [] } as History)
 const killState = atom({ plugin: 'sysmon', key: 'kill' } as const, null)
 const cleanupNote = atom({ plugin: 'sysmon', key: 'cleanup' } as const, null)
+const alertsState = atom({ plugin: 'sysmon', key: 'alerts' } as const, [] as NetAlert[])
+const ignoredState = atom({ plugin: 'sysmon', key: 'ignoredNet' } as const, [] as IgnoredNet[])
+const showIgnored = atom({ plugin: 'sysmon', key: 'showIgnored' } as const, false)
+
+const NET_TOP = 6 // senders listed under Network
+const DETAILS_TTL_MS = 20_000 // how long a process's details (connections above all) are reused
+const NOTIFY_AGAIN_MS = 30 * 60_000 // one macOS notification per process in this long, across sessions
+const HISTORY_LEN = 60
 
 let isOpen = false
 let platform = ''
@@ -43,6 +75,9 @@ let home = ''
 let timer: { cancel: () => void } | undefined
 let sampling: Promise<void> | undefined
 let stopped = false
+let tracker = newTracker()
+const detailCache = new Map<number, { name: string; at: number; details: NetDetails }>()
+const announced = new Set<string>()
 
 const errText = (err: unknown) => (err instanceof Error ? err.message : String(err))
 
@@ -61,10 +96,136 @@ async function sampleOnce($: EngineInterface) {
   if (os !== 'darwin' && os !== 'linux') throw new Error(`System monitor reads macOS and Linux; this machine is ${os}.`)
   const run = await $.process.run(['sh', '-c', os === 'darwin' ? DARWIN_SCRIPT : LINUX_SCRIPT], { timeoutMs: SAMPLE_TIMEOUT_MS })
   if (!run.stdout.includes('@@ps')) throw new Error(run.stderr.trim().split('\n').pop() || `sampling exited with ${run.exitCode}`)
-  const s = parseSample(run.stdout, os, await $.clock.now())
+  const at = await $.clock.now()
+  const s = parseSample(run.stdout, os, at)
+  const net = await readNet($, os, run.stdout, s, at)
+  if (net) s.net = net
   await update($, sampleState, () => s)
-  await update($, history, prev => pushHistory(prev ?? { cpu: [], ram: [] }, s))
+  await update($, history, prev => {
+    const h = pushHistory(prev ?? { cpu: [], ram: [] }, s)
+    if (!net) return h
+    return { ...h, netIn: [...(prev?.netIn ?? []), net.inRate].slice(-HISTORY_LEN), netOut: [...(prev?.netOut ?? []), net.outRate].slice(-HISTORY_LEN) }
+  })
   await update($, sampleError, () => null)
+}
+
+// ---------- network ----------
+
+const isIgnored = (a: { name: string; details?: NetDetails }, list: IgnoredNet[]) =>
+  list.some(i => i.key === a.name || (a.details?.path !== undefined && i.key === a.details.path))
+
+async function details($: EngineInterface, pid: number, name: string, at: number): Promise<NetDetails | undefined> {
+  if (platform !== 'darwin' || pid <= 0) return undefined
+  const hit = detailCache.get(pid)
+  if (hit && hit.name === name && at - hit.at < DETAILS_TTL_MS) return hit.details
+  try {
+    const run = await $.process.run(['sh', '-c', detailsScript(pid)], { timeoutMs: 10_000 })
+    const d = parseDetails(run.stdout, sections)
+    detailCache.set(pid, { name, at, details: d })
+    return d
+  } catch {
+    return hit?.details
+  }
+}
+
+/** The ignore list, as every session shares it through the plugin's store. */
+async function loadIgnored($: EngineInterface): Promise<IgnoredNet[]> {
+  const stored = (await $.store.get('netIgnore')) as IgnoredNet[] | undefined
+  const list = Array.isArray(stored) ? stored : []
+  const now = await read($, ignoredState)
+  if (JSON.stringify(now) !== JSON.stringify(list)) await update($, ignoredState, () => list)
+  return list
+}
+
+async function readNet($: EngineInterface, os: string, text: string, s: Sample, at: number): Promise<Net | undefined> {
+  const sec = sections(text)
+  let counters: Map<number, Counter>
+  let total: { in: number; out: number }
+  const perProcess = os === 'darwin' && !!sec.nettop?.trim()
+  if (os === 'darwin') {
+    counters = parseNettop(sec.nettop ?? '')
+    total = parseNetstat(sec.netstat ?? '')
+  } else {
+    total = parseProcNetDev(sec.netdev ?? '')
+    // No per-process counters without root: the machine's total stands in, and can trip the detector too.
+    counters = new Map([[0, { name: 'All traffic', ...total }]])
+  }
+  if (sec.netstat === undefined && sec.netdev === undefined) return undefined
+  const stats = step(tracker, at, counters, total)
+  const names = new Map(parseProcs(sec.ps ?? '').map(p => [p.pid, p.name]))
+  const chain = new Set(s.sessionPids)
+  const nameOf = (pid: number, fallback: string) => names.get(pid) ?? fallback
+  const guard = (pid: number, name: string) => (pid > 0 ? protection({ pid, name }, chain) : 'system')
+  const idleSec = Number((sec.idle ?? '').trim()) || 0
+  const tot = totalRates(tracker)
+
+  const top: NetProc[] = (perProcess ? stats : [])
+    .filter(x => x.outRate > 0 || x.inRate > 0)
+    .sort((a, b) => b.outRate - a.outRate || b.inRate - a.inRate)
+    .slice(0, NET_TOP)
+    .map(x => {
+      const name = nameOf(x.pid, x.name)
+      const why = guard(x.pid, name)
+      return { pid: x.pid, name, inRate: x.inRate, outRate: x.outRate, sent: x.sent, received: x.received, ...(why ? { protected: why } : {}) }
+    })
+
+  const ignored = await loadIgnored($)
+  const alerts: NetAlert[] = []
+  for (const x of stats) {
+    if (x.alertSince === undefined) continue
+    const name = nameOf(x.pid, x.name)
+    const d = await details($, x.pid, name, at)
+    const why = guard(x.pid, name)
+    const a: NetAlert = {
+      pid: x.pid,
+      name,
+      since: x.alertSince,
+      inRate: x.inRate,
+      outRate: x.outRate,
+      sent: x.sent,
+      received: x.received,
+      sustainedMs: x.sustainedMs,
+      idleSec,
+      ...(d ? { details: d } : {}),
+      ...(why ? { protected: why } : {}),
+    }
+    if (!isIgnored(a, ignored)) alerts.push(a)
+  }
+  alerts.sort((a, b) => b.outRate - a.outRate)
+  await update($, alertsState, () => alerts)
+  for (const a of alerts) await announce($, a, at)
+  for (const pid of [...detailCache.keys()]) if (!counters.has(pid)) detailCache.delete(pid)
+  return { perProcess, inRate: tot.inRate, outRate: tot.outRate, top, idleSec }
+}
+
+/** A toast in this session, and one macOS notification per process across sessions: the person may be away. */
+async function announce($: EngineInterface, a: NetAlert, at: number) {
+  const key = `${a.pid}:${a.name}`
+  if (announced.has(key)) return
+  announced.add(key)
+  $.ui.toast(`Unusual upload: ${a.name} (pid ${a.pid}) sent ${bytes(a.sent)} recently, now ${rateText(a.outRate)}. Open System to review it.`)
+  if (platform !== 'darwin') return
+  try {
+    const seen = ((await $.store.get('netNotified')) ?? {}) as Record<string, number>
+    if (seen[key] !== undefined && at - seen[key] < NOTIFY_AGAIN_MS) return
+    const kept = Object.fromEntries(Object.entries(seen).filter(([, t]) => at - t < 24 * 3_600_000))
+    await $.store.set('netNotified', { ...kept, [key]: at })
+    await $.process.run(['osascript', '-e', notificationScript('Unusual upload', `${a.name} (pid ${a.pid}) is sending ${rateText(a.outRate)}: ${bytes(a.sent)} in the last 10 min.`)], { timeoutMs: 10_000 })
+  } catch {}
+}
+
+async function ignoreAlert($: EngineInterface, a: NetAlert) {
+  const key = ignoreKey(a)
+  const now = await $.clock.now()
+  const list = await update($, ignoredState, l => (l.some(i => i.key === key) ? l : [...l, { key, name: a.name, at: now }]))
+  await $.store.set('netIgnore', list)
+  await update($, alertsState, l => l.filter(x => !isIgnored(x, list)))
+  $.ui.toast(`Ignoring uploads from ${a.name}. Unignore it under Network.`)
+}
+
+async function unignore($: EngineInterface, key: string) {
+  const list = await update($, ignoredState, l => l.filter(i => i.key !== key))
+  await $.store.set('netIgnore', list)
 }
 
 /** One sample at a time; a second ask waits for the one under way. */
@@ -163,7 +324,10 @@ async function runKill($: EngineInterface, signal: 'TERM' | 'KILL') {
     }
     return
   }
-  if (outcome === 'gone') $.ui.toast(`Ended ${k.name} (pid ${k.pid}) with SIG${signal}.`)
+  if (outcome === 'gone') {
+    $.ui.toast(`Ended ${k.name} (pid ${k.pid}) with SIG${signal}.`)
+    await update($, alertsState, l => l.filter(a => a.pid !== k.pid))
+  }
   await update($, killState, () => null)
   void sampleNow($)
 }
@@ -190,7 +354,9 @@ export const register: Register = on => {
     const started = await next(e)
     stopped = false
     home = (await $.env.get('HOME')) ?? ''
-    await $.command.register({ name: 'sysmon', description: 'Open the System pane: CPU, RAM, disk and top processes (args: refresh)', immediate: true })
+    tracker = newTracker()
+    await loadIgnored($).catch(() => undefined)
+    await $.command.register({ name: 'sysmon', description: 'Open the System pane: CPU, RAM, network, disk and top processes (args: refresh)', immediate: true })
     loop($)
     if (e.isInteractive && e.surface) await autoOpen($)
     return started
@@ -233,7 +399,13 @@ export const register: Register = on => {
     if (e.props.hasSurvey) return previous
     const { Box, Button, Text } = $.ui.resolve(e)
     const s = await read($, sampleState)
+    const alerts = await read($, alertsState)
     const parts = s ? bandParts(s) : []
+    if (alerts.length) {
+      const a = alerts[0] as NetAlert
+      const level = alerts.some(x => alertNotes(x).level === 'error') ? 'error' : 'warning'
+      parts.push({ text: `⚠ Upload: ${a.name} ${rateText(a.outRate)}${alerts.length > 1 ? ` · ${alerts.length - 1} more` : ''}`, level })
+    } else if (s?.net) parts.push({ text: `↑ ${rateText(s.net.outRate)} ↓ ${rateText(s.net.inRate)}`, level: 'ok' })
     const line = parts.length ? (
       <Text wrap="truncate-end">
         {parts.flatMap((p, i) => [
@@ -267,6 +439,9 @@ export const register: Register = on => {
     const hist = (await read($, history)) ?? { cpu: [], ram: [] }
     const k = await read($, killState)
     const note = await read($, cleanupNote)
+    const alerts = await read($, alertsState)
+    const ignored = await read($, ignoredState)
+    const ignoredShown = await read($, showIgnored)
     const cols = Math.max(30, e.props.bodyColumns)
     const px = Math.max(200, Math.min(900, cols * 8))
 
@@ -325,7 +500,7 @@ export const register: Register = on => {
               key={`kill-${list}-${p.pid}`}
               label="Kill"
               dimColor
-              onPress={() => void update($, killState, () => ({ pid: p.pid, name: p.name, stage: 'confirm' }))}
+              onPress={() => void update($, killState, (): KillState => ({ pid: p.pid, name: p.name, stage: 'confirm', from: list === 'mem' ? 'mem' : 'cpu' }))}
             />
           )}
         </Box>
@@ -405,27 +580,175 @@ export const register: Register = on => {
       </Text>
     )
 
+    const killAt = (from: 'cpu' | 'mem' | 'net', pid?: number) => (k && (k.from ?? 'cpu') === from && (pid === undefined || k.pid === pid) ? killCard : null)
+    const askKill = (pid: number, name: string) => () => void update($, killState, (): KillState => ({ pid, name, stage: 'confirm', from: 'net' }))
+    const label = (what: string, value: string | undefined, key: string) =>
+      value ? (
+        <Box key={key} flexDirection="row" columnGap={1}>
+          <Box width={9} flexShrink={0}>
+            <Text dimColor>{what}</Text>
+          </Box>
+          <Box flexGrow={1} flexShrink={1}>
+            <Text wrap="wrap">{value}</Text>
+          </Box>
+        </Box>
+      ) : null
+
+    const alertCard = (a: NetAlert) => {
+      const { level, notes } = alertNotes(a)
+      const d = a.details
+      const steady = a.sustainedMs >= 60_000 ? ` · steady for ${duration(a.sustainedMs)}` : ''
+      const killShown = k?.from === 'net' && k.pid === a.pid
+      return (
+        <Box key={`alert-${a.pid}`} flexDirection="column" rowGap={1} borderStyle="round" borderColor={COLOR[level]} paddingX={1}>
+          <Text color={COLOR[level]} weight="semibold">{`⚠ ${a.name}${a.pid ? ` (pid ${a.pid})` : ''} keeps uploading`}</Text>
+          <Text>{`Sent ${bytes(a.sent)} and received ${bytes(a.received)} in the last ${duration(WINDOW_MS)} · now ↑ ${rateText(a.outRate)} ↓ ${rateText(a.inRate)}${steady}`}</Text>
+          {notes.map((n, i) => (
+            <Text key={`note-${a.pid}-${i}`} color={COLOR[level]}>
+              {n}
+            </Text>
+          ))}
+          <Box flexDirection="column">
+            {label('Program', d?.path ?? (a.pid ? 'path unknown' : undefined), `path-${a.pid}`)}
+            {label('Signed', d?.signature?.text, `sign-${a.pid}`)}
+            {label('Command', d?.args, `args-${a.pid}`)}
+            {label('Started', [d?.started, d?.user ? `as ${d.user}` : '', d?.parent ? `by ${d.parent}` : ''].filter(Boolean).join(' · ') || undefined, `start-${a.pid}`)}
+            {label('Sending to', d ? (d.remotes.length ? d.remotes.join(', ') : 'no open connection found right now') : undefined, `remote-${a.pid}`)}
+            {a.pid ? null : label('Note', 'Linux shows no per-process traffic; check with nethogs or ss -tp as root.', 'linux-note')}
+          </Box>
+          {killShown ? killCard : null}
+          <Box flexDirection="row" columnGap={1} alignItems="center">
+            {a.protected ? (
+              <Text dimColor>{`🔒 ${PROTECTED_LABEL[a.protected]}: no Kill`}</Text>
+            ) : killShown ? null : (
+              <Button key={`net-kill-${a.pid}`} label={`Kill ${a.name}`} onPress={askKill(a.pid, a.name)} />
+            )}
+            <Button key={`net-ignore-${a.pid}`} label="Ignore" dimColor onPress={() => void ignoreAlert($, a)} />
+          </Box>
+        </Box>
+      )
+    }
+
+    const net = s.net
+    const netHeader = (
+      <Box flexDirection="row" columnGap={1}>
+        <Box flexGrow={1}>
+          <Text dimColor>Process</Text>
+        </Box>
+        <Box width={7} justifyContent="flex-end">
+          <Text dimColor>pid</Text>
+        </Box>
+        <Box width={10} justifyContent="flex-end">
+          <Text dimColor>↑ up</Text>
+        </Box>
+        <Box width={10} justifyContent="flex-end">
+          <Text dimColor>↓ down</Text>
+        </Box>
+        <Box width={13} />
+      </Box>
+    )
+    const netRow = (p: NetProc) => (
+      <Box key={`net-${p.pid}`} flexDirection="row" columnGap={1} alignItems="center">
+        <Box flexGrow={1} flexShrink={1} minWidth={8}>
+          <Text wrap="truncate-end" dimColor={!!p.protected}>
+            {p.name}
+          </Text>
+        </Box>
+        <Box width={7} justifyContent="flex-end">
+          <Text dimColor>{String(p.pid)}</Text>
+        </Box>
+        <Box width={10} justifyContent="flex-end">
+          <Text color={p.outRate >= OUT_RATE ? 'warning' : undefined}>{rateText(p.outRate)}</Text>
+        </Box>
+        <Box width={10} justifyContent="flex-end">
+          <Text>{rateText(p.inRate)}</Text>
+        </Box>
+        <Box width={13} justifyContent="flex-end">
+          {p.protected ? (
+            <Text dimColor>{`🔒 ${PROTECTED_LABEL[p.protected]}`}</Text>
+          ) : (
+            <Button key={`kill-net-${p.pid}`} label="Kill" dimColor onPress={askKill(p.pid, p.name)} />
+          )}
+        </Box>
+      </Box>
+    )
+    const netSection = net ? (
+      <Box key="net" flexDirection="column" rowGap={1}>
+        <Box flexDirection="column">
+          <Box flexDirection="row" columnGap={1}>
+            <Text weight="semibold">Network</Text>
+            <Text color={net.outRate >= OUT_RATE ? 'warning' : undefined} weight="semibold">{`↑ ${rateText(net.outRate)}`}</Text>
+            <Text weight="semibold">{`↓ ${rateText(net.inRate)}`}</Text>
+            <Text dimColor wrap="truncate-end">
+              {net.idleSec >= 60 ? `· you have been away ${duration(net.idleSec * 1000)}` : '· up orange, down blue'}
+            </Text>
+          </Box>
+          {Svg ? (
+            <Svg key="net-spark" alt={`Network over the last ${(hist.netOut ?? []).length} readings`} width={px} height={28} source={netSparkSvg(hist.netIn ?? [], hist.netOut ?? [], px, 28)} />
+          ) : (
+            <Text dimColor>{`↑ ${sparkText(scaled(hist.netOut ?? []), Math.min(60, cols - 4))}`}</Text>
+          )}
+        </Box>
+        {k?.from === 'net' && !alerts.some(a => a.pid === k.pid) ? killCard : null}
+        {net.perProcess ? (
+          net.top.length ? (
+            <Box flexDirection="column">
+              {netHeader}
+              {net.top.map(netRow)}
+            </Box>
+          ) : (
+            <Text dimColor>No process is sending or receiving right now.</Text>
+          )
+        ) : (
+          <Text dimColor>Per-process traffic needs macOS (nettop); here only the machine's total is watched.</Text>
+        )}
+        <Text dimColor wrap="wrap">{`Alerts when a program sends over ${rateText(OUT_RATE)} for a minute, or ${bytes(VOLUME)} in ${duration(WINDOW_MS)}, at least twice what it receives. An alert stays ${duration(CLEAR_MS)} after it stops.`}</Text>
+        {ignored.length ? (
+          <Box flexDirection="column">
+            <Button key="net-show-ignored" label={`${ignored.length} ignored · ${ignoredShown ? 'Hide' : 'Show'}`} dimColor onPress={() => void update($, showIgnored, v => !v)} />
+            {ignoredShown
+              ? ignored.map(i => (
+                  <Box key={`ignored-${i.key}`} flexDirection="row" columnGap={1} alignItems="center">
+                    <Box flexGrow={1} flexShrink={1}>
+                      <Text wrap="truncate-start" dimColor>
+                        {i.key === i.name ? i.name : `${i.name} · ${i.key}`}
+                      </Text>
+                    </Box>
+                    <Button key={`net-unignore-${i.key}`} label="Unignore" dimColor onPress={() => void unignore($, i.key)} />
+                  </Box>
+                ))
+              : null}
+          </Box>
+        ) : null}
+      </Box>
+    ) : null
+
     const age = Math.max(0, Math.round(((await $.clock.now()) - s.at) / 1000))
     const memDetail = `${bytes(s.mem.used)} of ${bytes(s.mem.total)}${s.mem.swapTotal ? ` · swap ${bytes(s.mem.swapUsed)}` : ''}`
 
     return (
       <Box flexDirection="column" rowGap={1}>
         {err ? <Text color="error">{`Last reading failed: ${err}`}</Text> : null}
+        {alerts.length ? section('Network alerts') : null}
+        {alerts.map(alertCard)}
         {meter('cpu', 'CPU', pct(s.cpu.percent), `${s.cpu.cores} cores · load ${s.cpu.load1.toFixed(2)}`, cpuLevel(s.cpu.percent), hist.cpu)}
         {meter('ram', 'RAM', pct(s.mem.percent), memDetail, ramLevel(s.mem.percent), hist.ram)}
 
         {section('Top by CPU')}
-        {killCard}
+        {killAt('cpu')}
         <Box flexDirection="column">
           {header}
           {s.topCpu.map(p => procRow('cpu', p))}
         </Box>
 
         {section('Top by memory')}
+        {killAt('mem')}
         <Box flexDirection="column">
           {header}
           {s.topMem.map(p => procRow('mem', p))}
         </Box>
+
+        {netSection}
 
         {section('Disks')}
         {s.disks.length ? diskRows : <Text dimColor>No volumes found.</Text>}

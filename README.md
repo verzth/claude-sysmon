@@ -5,12 +5,14 @@ A pane beside the chat that shows how this machine is doing:
 - **CPU**: how busy all cores were over the last second, with the load average and a history line of the last readings.
 - **RAM**: memory in use out of the total (counted as Activity Monitor does: app memory, wired and compressed), swap in use, and a history line.
 - **Top by CPU** and **Top by memory**: the busiest processes, each with its name, pid, %CPU and resident memory, and a **Kill** button.
+- **Network**: bytes per second going out (↑) and coming in (↓), a history line of both, and the programs sending the most, each with a **Kill** button.
+- **Network alerts**: a program that keeps uploading, much more than it downloads, gets a card at the top of the pane with everything that can be found out about it, and **Kill** and **Ignore** buttons. See [Upload alerts](#upload-alerts).
 - **Disks**: each volume you store things on, with used, free, how full it is and a bar. A volume running low turns yellow; one almost full turns red.
 - **Clean up disk…**: starts a new Claude Code session that finds what takes space and plans what you could free. It deletes nothing.
 
-A **System** button above the prompt, in every session, opens the pane, and a line under the buttons reads `CPU 34% · RAM 71% · Disk 82%`. A number past its threshold turns yellow or red, so you notice without opening the pane.
+A **System** button above the prompt, in every session, opens the pane, and a line under the buttons reads `CPU 34% · RAM 71% · Disk 82% · ↑ 120 KB/s ↓ 2.1 MB/s`. A number past its threshold turns yellow or red, so you notice without opening the pane. While a program trips the upload alert, the network part reads `⚠ Upload: rclone 3.2 MB/s` instead.
 
-Nothing is sent to a model: the numbers come from `ps`, `iostat`, `vm_stat`, `sysctl` and `df` (or `/proc` on Linux), so watching costs no tokens.
+Nothing is sent to a model: the numbers come from `ps`, `iostat`, `vm_stat`, `sysctl`, `nettop`, `netstat` and `df` (or `/proc` on Linux), so watching costs no tokens.
 
 ## Install
 
@@ -37,6 +39,8 @@ Then run `/reload-plugins` (or start a new session) and open the pane with the *
 | **System** (above the prompt) | Opens the pane. |
 | `/sysmon` | Opens the pane. `/sysmon refresh` takes a new reading now. |
 | **Kill** | Asks first: a card names the process and its pid, with **Kill <name>** and **Cancel**. Confirming sends SIGTERM, which asks the process to quit and save. If it is still running two seconds later, the card offers **Force kill (SIGKILL)**, which ends it at once. |
+| **Kill** (network alert) | The same confirm, SIGTERM, then SIGKILL steps, shown inside the alert card. |
+| **Ignore** (network alert) | Stops alerting on that program, by its executable path (or its name when the path is unknown), in every session and from now on. **N ignored · Show** under Network lists them with **Unignore**. |
 | **Clean up disk…** | Opens a new session in the Claude desktop app with a cleanup prompt filled in, in your home folder. Press Enter there to start it. |
 | **Refresh** | Takes a new reading now. |
 
@@ -45,6 +49,32 @@ Then run `/reload-plugins` (or start a new session) and open the pane with the *
 - Some processes never get a Kill button and show 🔒 instead: pid 0 and 1, `kernel_task`, `launchd`, `WindowServer`, `loginwindow` (and `systemd`/`init` on Linux), the Claude app and every `claude` process, and the process this session runs in with every process above it.
 - Before each signal the pid is looked up again. If it now belongs to a different program, or is protected, nothing is sent.
 - A process of another user (or root) answers *Operation not permitted*; the pane shows that in a toast and sends nothing more.
+
+### Upload alerts
+
+Data theft rarely looks busy: the screen is idle, but something keeps sending. The detector watches every program's outgoing bytes (`nettop`, external interfaces only, so local servers and loopback do not count) and raises an alert when a program:
+
+- sends more than **256 KB/s for a minute** without a break, or
+- sends **100 MB within 10 minutes**,
+
+and in both cases sends at least **twice what it receives**. A video call or a download sends about as much as it gets, or less, and is left alone. An alert stays two minutes after the upload stops, so a short pause does not hide it.
+
+Each alert card shows what could be found out about the program:
+
+| Line | Where it comes from |
+| --- | --- |
+| Sent, received, rates, how long it has been steady | The `nettop` counters of the last 10 minutes |
+| Program | The executable's path (`lsof -d txt`) |
+| Signed | `codesign`: part of macOS, a Developer ID (with the company), the Mac App Store, ad-hoc, or not signed |
+| Command | Its full command line (`ps -o args`) |
+| Started | When, as which user, and by which parent process |
+| Sending to | The remote addresses of its open connections (`lsof -i`), established ones first |
+
+The card turns **red** instead of yellow, with the reason spelled out, when you have been away (no keyboard or mouse for 2 minutes), when the program is unsigned or ad-hoc signed, or when it runs from `/tmp`, a temporary folder, Downloads or `/Users/Shared`.
+
+A new alert shows a toast in every session with the pane's plugin, and one macOS notification per program in 30 minutes across all sessions, so you see it even when you come back from being away. (The first notification may make macOS ask whether Script Editor may show notifications.)
+
+Backups, cloud sync (Dropbox, iCloud, Google Drive), uploads you started and VPN apps that carry other programs' traffic (Tailscale, for one) will trip it too: **Ignore** them once.
 
 ### The cleanup session
 
@@ -61,7 +91,9 @@ It is told never to run a command that deletes, moves, prunes or empties anythin
 - While the pane is open: a new reading two seconds after the last one ended (each reading spends one second measuring CPU), so about every three seconds.
 - While it is closed: every 30 seconds, enough to keep the line above the prompt current.
 
-One reading is one short shell running `iostat`, `vm_stat`, `sysctl`, `ps` and `df`; together they use a few milliseconds of CPU.
+One reading is one short shell running `iostat`, `vm_stat`, `sysctl`, `ps`, `df`, `nettop`, `netstat` and `ioreg`; together they use a few tens of milliseconds of CPU. The details of a program (`lsof`, `codesign`) are read only while it trips the alert, at most every 20 seconds.
+
+Because each session with the plugin reads on its own, the upload alert works while the pane is closed: every 30 seconds, so a steady upload is caught within about 90 seconds.
 
 ### Thresholds
 
@@ -70,16 +102,21 @@ One reading is one short shell running `iostat`, `vm_stat`, `sysctl`, `ps` and `
 | CPU | 75% or more | 90% or more |
 | RAM | 85% or more | 95% or more |
 | Disk | under 10% or under 15 GB free | under 5% or under 5 GB free |
+| Upload | a program over 256 KB/s for a minute, or 100 MB in 10 min, at least twice what it receives | the same, while you are away, or from an unsigned program, or from a temporary folder |
 
 ### Limits
 
 - macOS first; Linux is read from `/proc` and `ps`. Other systems show a message instead of numbers.
 - %CPU per process is what `ps` reports: on macOS a short running average, on Linux the average since the process started. 100% is one full core, so a busy process can show more than 100%.
+- Per-process network numbers need macOS (`nettop`). On Linux only the machine's total is watched, and an alert names no program: check with `nethogs` or `ss -tp` as root.
+- `nettop` counts what a program sent since it started; the pane measures the change between readings, so traffic before the plugin loaded is not counted.
+- `lsof` and `codesign` cannot see into another user's or root's processes: their path, connections and signer may show as unknown.
+- A program that sends a little at a time (under 256 KB/s and under 100 MB per 10 minutes) passes unnoticed.
 - On macOS the startup disk is shown once for its whole APFS container: system, VM, preboot and recovery volumes share its free space and are left out, as are simulator runtimes and other system mounts.
 
 ## Privacy
 
-Everything stays on this machine. The plugin writes only whether the pane was open, in its own storage, so it opens again in your next session. Process names and disk readings go nowhere except into the cleanup prompt, and only when you press **Clean up disk…**.
+Everything stays on this machine. The plugin writes only, in its own storage: whether the pane was open, the list of ignored programs (their names and paths), and when each upload notification was shown. Process names and disk readings go nowhere except into the cleanup prompt, and only when you press **Clean up disk…**. Command lines and connection addresses of an alerted program are shown in the pane and kept in the session's memory only.
 
 ## Development
 
@@ -91,7 +128,7 @@ claude plugin test .
 claude plugin validate .
 ```
 
-`hooks/model.ts` holds the commands and the parsing, as plain functions; `hooks/register.tsx` the hooks, the pane and the band. `hooks/band.ts` is the band layout shared with the other mods that draw above the prompt (tasklist, bi-dash, workers): keep the copies in step.
+`hooks/model.ts` holds the commands and the parsing, and `hooks/net.ts` the network counters and the upload detector, as plain functions; `hooks/register.tsx` the hooks, the pane and the band. `hooks/band.ts` is the band layout shared with the other mods that draw above the prompt (tasklist, bi-dash, workers): keep the copies in step.
 
 ## License
 

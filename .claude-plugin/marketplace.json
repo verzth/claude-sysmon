@@ -11,8 +11,8 @@
     {
       "name": "sysmon",
       "source": "./",
-      "description": "CPU, RAM and disk space beside the chat, the busiest processes with a confirmed Kill, and a disk Cleanup session.",
-      "version": "0.1.0"
+      "description": "CPU, RAM, network and disk space beside the chat, an alert for steady uploads, the busiest processes with a confirmed Kill, and a disk Cleanup session.",
+      "version": "0.2.0"
     }
   ]
 }
