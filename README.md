@@ -27,7 +27,7 @@ claude plugin install sysmon@claude-sysmon
 From a local checkout, add the folder instead:
 
 ```bash
-claude plugin marketplace add ~/Workspace/ai/claude-sysmon
+claude plugin marketplace add /path/to/claude-sysmon
 ```
 
 Then run `/reload-plugins` (or start a new session) and open the pane with the **System** button above the prompt, or `/sysmon`. (The command is not `/tasks` or `/system`: the desktop app has its own panels by similar names.)
