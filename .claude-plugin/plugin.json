@@ -1,0 +1,14 @@
+{
+  "name": "sysmon",
+  "version": "0.1.0",
+  "description": "System monitor pane beside the chat: CPU, RAM and disk space of this machine, the busiest processes with a confirmed Kill, and a Cleanup button that starts a new session to plan freeing disk space. Reads ps, vm_stat, sysctl and df; costs no model tokens.",
+  "author": {
+    "name": "ai",
+    "url": "https://git.verzth.work/ai"
+  },
+  "homepage": "https://git.verzth.work/ai/claude-sysmon",
+  "repository": "https://git.verzth.work/ai/claude-sysmon",
+  "license": "MIT",
+  "keywords": ["cpu", "memory", "disk", "processes", "monitor", "pane", "mod"],
+  "types": "./types/index.d.ts"
+}
